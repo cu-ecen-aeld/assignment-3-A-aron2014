@@ -3,7 +3,9 @@
 #include <unistd.h>
 #include <sys/types.h>
 #include <sys/wait.h>
-#include <errno.h>
+#include <errno.h> //for errno
+#include <string.h> //for strlen
+#include <fcntl.h> // for open,O_WRONLY etc
 #define _XOPEN_SOURCE
 /**
  * @param cmd the command to execute with system()
@@ -127,7 +129,7 @@ bool do_exec_redirect(const char *outputfile, int count, ...)
  *   The rest of the behaviour is same as do_exec()
  *
 */
-	int fd;
+	
 	fflush(stdout);//flush buffer before fork
 	pid_t pid=fork();
 	if(pid==-1){
@@ -137,10 +139,21 @@ bool do_exec_redirect(const char *outputfile, int count, ...)
 	if(pid==0){
 
 		if(strlen(outputfile)>0){
-			fd=open(outputfile, O_WRONLY|O_TRUNC|O_CREAT, 0644);
-			if(fd<0){perror("open");exit(1);}
-			if(dup2(fd,STDOUT_FILENO)<0){perror("dup2");exit(1);}
-			if(close(fd)==-1){perror("close");exit(1);}
+			int fd=open(outputfile, O_WRONLY|O_TRUNC|O_CREAT, 0644);
+			if(fd<0){
+				perror("open");
+				exit(1);
+			}
+			if(dup2(fd,STDOUT_FILENO)<0)
+			{
+				perror("dup2");
+				exit(1);
+			}
+			if(close(fd)==-1)
+			{
+				perror("close");
+				exit(1);
+			}
 			execv(command[0], command);
 			perror("execv");
 			exit(1);
@@ -151,9 +164,9 @@ bool do_exec_redirect(const char *outputfile, int count, ...)
 		perror("waitpid");
 		va_end(args);
 		return false;
-
+	}
     	va_end(args);
-    	if(close(fd)==-1){perror("close") return false;}
+
 
 	if(WIFEXITED(status)&&WEXITSTATUS(status)!=0){perror("parent");return false;}
     	return true;
