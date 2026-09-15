@@ -1,5 +1,12 @@
 #include "systemcalls.h"
-
+#include <stdlib.h>
+#include <unistd.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <errno.h> //for errno
+#include <string.h> //for strlen
+#include <fcntl.h> // for open,O_WRONLY etc
+#define _XOPEN_SOURCE
 /**
  * @param cmd the command to execute with system()
  * @return true if the command in @param cmd was executed
@@ -16,7 +23,14 @@ bool do_system(const char *cmd)
  *   and return a boolean true if the system() call completed with success
  *   or false() if it returned a failure
 */
+	errno=0;
+	int rc = 0;
+     	rc = system(cmd);
+	if (rc != 0){
+		return false;
+	}
 
+	if(errno!=0){perror("system");return false;}
     return true;
 }
 
@@ -58,10 +72,33 @@ bool do_exec(int count, ...)
  *   as second argument to the execv() command.
  *
 */
+    	errno=0;
+	pid_t pid;
+	fflush(stdout);//flush buffer before fork
+	pid = fork();
+	if (pid==-1){
+		perror("fork");
+		return false;
+	}
 
-    va_end(args);
+	if(pid==0){
+		
+		execv(command[0], command);
+		perror("execv");
+		exit(1);
+	}
 
-    return true;
+	//Back on the parent process
+	int status;
+	if(waitpid(pid, &status,0)==-1){
+		perror("waitpid");
+		va_end(args);//need toclose this even if it fails
+		return false;
+		}
+
+    	va_end(args);
+	if(WIFEXITED(status)&&WEXITSTATUS(status)!=0){perror("parent");return false;}
+    	return true;
 }
 
 /**
@@ -92,8 +129,46 @@ bool do_exec_redirect(const char *outputfile, int count, ...)
  *   The rest of the behaviour is same as do_exec()
  *
 */
+	
+	fflush(stdout);//flush buffer before fork
+	pid_t pid=fork();
+	if(pid==-1){
+		perror("fork");
+		return false;
+	}
+	if(pid==0){
 
-    va_end(args);
+		if(strlen(outputfile)>0){
+			int fd=open(outputfile, O_WRONLY|O_TRUNC|O_CREAT, 0644);
+			if(fd<0){
+				perror("open");
+				exit(1);
+			}
+			if(dup2(fd,STDOUT_FILENO)<0)
+			{
+				perror("dup2");
+				exit(1);
+			}
+			if(close(fd)==-1)
+			{
+				perror("close");
+				exit(1);
+			}
+			execv(command[0], command);
+			perror("execv");
+			exit(1);
+		}
+	}
+	int status;
+	if(waitpid(pid,&status,0)==-1){
+		perror("waitpid");
+		va_end(args);
+		return false;
+	}
+    	va_end(args);
 
-    return true;
+
+	if(WIFEXITED(status)&&WEXITSTATUS(status)!=0){perror("parent");return false;}
+    	return true;
+    
 }
