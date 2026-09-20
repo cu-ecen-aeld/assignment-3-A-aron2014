@@ -32,7 +32,7 @@ echo "Writing ${NUMFILES} files containing string ${WRITESTR} to ${WRITEDIR}"
 rm -rf "${WRITEDIR}"
 
 # create $WRITEDIR if not assignment1
-assignment=`cat etc/finder-app//conf/assignment.txt`
+assignment=`cat /etc/finder-app//conf/assignment.txt`
 
 if [ $assignment != 'assignment3' ]
 then
