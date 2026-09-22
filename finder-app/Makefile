@@ -1,6 +1,8 @@
 CROSS_COMPILE ?= 
-	CC=$(CROSS_COMPILE)gcc
+CC=$(CROSS_COMPILE)gcc
 CFLAGS=-Wall -g
+
+all: writer
 
 writer: writer.o
 	$(CC) $(CFLAGS) -o writer writer.o
