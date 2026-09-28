@@ -18,6 +18,7 @@
 #define PORT ("9000")
 #define BACKLOG (10)
 #define DATAFILE ("/var/tmp/aesdsocketdata")
+#define CHUNK_SIZE (1024)
 // get sockaddr, IPv4 or IPv6:
 void *get_in_addr(struct sockaddr *sa)
 {
@@ -40,7 +41,7 @@ static int set_signals(void){
 	memset(&sa, 0, sizeof sa);
 	sa.sa_handler = handle_signal;
 	sigemptyset(&sa.sa_mask);
-	sa.sa_flag = 0;
+	sa.sa_flags = 0;
 	
 	if(sigaction(SIGINT, &sa, NULL)==-1) return -1;
 	
@@ -50,71 +51,78 @@ static int set_signals(void){
 }
 
 static int open_listen_socket(void){
+	struct addrinfo hints, *servinfo, *p;
+	int sockfd = -1;
+	int yes = 1;
+	int rv;
 
-   if ((rv = getaddrinfo(NULL, PORT, &hints, &servinfo)) != 0) {
-        //fprintf(stderr, "getaddrinfo: %s\n", gai_strerror(rv));
-	syslog(LOG_ERROR, "getaddrinfo: %s\n", gai_strerror(rv));
+	memset(&hints, 0, sizeof hints);
+	hints.ai_family   = AF_INET;
+	hints.ai_socktype = SOCK_STREAM;
+   	hints.ai_flags    = AI_PASSIVE;
+  	 if ((rv = getaddrinfo(NULL, PORT, &hints, &servinfo)) != 0) {
+        	//fprintf(stderr, "getaddrinfo: %s\n", gai_strerror(rv));
+		syslog(LOG_ERR, "getaddrinfo: %s\n", gai_strerror(rv));
         
-	return -1;
-    }
+		return -1;
+	 }
 
-    // loop through all the results and bind to the first we can
-    for(p = servinfo; p != NULL; p = p->ai_next) {
-        if ((sockfd = socket(p->ai_family, p->ai_socktype,
-                p->ai_protocol)) == -1) {
-            perror("server: socket");
-	    syslog(LOG_ERROR, "server socket: %s", strerror(errno));
+	// loop through all the results and bind to the first we can
+	for(p = servinfo; p != NULL; p = p->ai_next) {
+        	if ((sockfd = socket(p->ai_family, p->ai_socktype,p->ai_protocol)) == -1) {
+            		perror("server: socket");
+	    		syslog(LOG_ERR, "server socket: %s", strerror(errno));
         
-	    continue;
-        }
+	    		continue;
+        	}
 
-        if (setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &yes,sizeof(int)) == -1) {
-            perror("setsockopt");
-	    syslog(LOG_ERROR, "setsockopt: %s", strerror(errno));
-	    freeaddrinfo(servinfo);//free if failed
-	    close(sockfd);
+        	if (setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &yes,sizeof(int)) == -1) {
+            		perror("setsockopt");
+	    		syslog(LOG_ERR, "setsockopt: %s", strerror(errno));
+	    		freeaddrinfo(servinfo);//free if failed
+	    		close(sockfd);
             
-	    return -1;
-        }
+	    		return -1;
+        	}
 
-        if (bind(sockfd, p->ai_addr, p->ai_addrlen) == -1) {
-            close(sockfd);
-            perror("server: bind");
-	    syslog(LOG_ERROR, "server bind: %s", strerror(errno));
+        	if (bind(sockfd, p->ai_addr, p->ai_addrlen) == -1) {
+            		close(sockfd);
+            		perror("server: bind");
+	    		syslog(LOG_ERR, "server bind: %s", strerror(errno));
             
-	    continue;
-        }
+	    		continue;
+       		 }
 
-        break;
-    }
+        	break;
+    	}
 
-    freeaddrinfo(servinfo); // all done with this structure
+    	freeaddrinfo(servinfo); // all done with this structure
 
-    if (p == NULL)  {
-        //fprintf(stderr, "server: failed to bind\n");
-	syslog(LOG_ERROR, "server: failed to bind\n");
-	close(sockfd);
+    	if (p == NULL)  {
+        	//fprintf(stderr, "server: failed to bind\n");
+		syslog(LOG_ERR, "server: failed to bind\n");
+		close(sockfd);
         
-	return -1;
-    }
+		return -1;
+    	}
 
-    if (listen(sockfd, BACKLOG) == -1) {
-        perror("listen");
-	syslog(LOG_ERROR, "listen: %s", strerror(errno));
-	close(sockfd);
+    	if (listen(sockfd, BACKLOG) == -1) {
+        	perror("listen");
+		syslog(LOG_ERR, "listen: %s", strerror(errno));
+		close(sockfd);
         
-	return -1;
-    }
+		return -1;
+    	}
 
-    return sockfd;
+   	return sockfd;
 	
 }
 
 static int send_file(int data_fd, int client_fd){
      char out[CHUNK_SIZE];
 
-     if(lseek(data_fd, 0,SEEK_SET )!=0){
-     	syslog(LOG_ERROR, "lseek: %s", strerror(errno));
+     if(lseek(data_fd, 0,SEEK_SET )<0){
+     	syslog(LOG_ERR, "lseek: %s", strerror(errno));
      	
 	return -1;	
      }
@@ -122,7 +130,7 @@ static int send_file(int data_fd, int client_fd){
      for(;;)
      {
 	     n=read(data_fd, out, sizeof out);
-	     off = sizeof out;
+	     off=0;
 	     if(n==0){
 		syslog(LOG_DEBUG, "file sender: end of file reached.");
 		return 0;
@@ -130,7 +138,7 @@ static int send_file(int data_fd, int client_fd){
 	     if(n<1){
 		if(errno==EINTR)
 			continue;
-		syslog(LOG_ERROR, "read: %s", strerror(errno));
+		syslog(LOG_ERR, "read: %s", strerror(errno));
 		return -1;
 	     }
 
@@ -152,7 +160,7 @@ static int grow_buffer(char **buf, size_t *cap, size_t need){
 	if (need<*cap)
 		return 0;
 
-	size_t new_cap = (*cap==0)?CHUNK:*cap;
+	size_t new_cap = (*cap==0)?CHUNK_SIZE:*cap;
 	//Grow the size of the new max size for the buffer
 	while(new_cap<need)
 		new_cap*=2;
@@ -218,10 +226,10 @@ static int handle_client(int client_fd, int data_fd){
 		//Handle complete packets
 		char *nl;
 
-		while(len>0 &&(nl=memchar(buf, '\n', len))!=NULL){
+		while(len>0 &&(nl=memchr(buf, '\n', len))!=NULL){
 			size_t pkt=(size_t)(nl-buf)+1; //this will include the \n character
-			if (write(data_fd, buf, pkt)=(size_t)pkt){
-				syslog(LOG_ERR, "write %s failed: %s", DATA_FILE, strerror(errno));
+			if (write(data_fd, buf, pkt)!=(size_t)pkt){
+				syslog(LOG_ERR, "write %s failed: %s", DATAFILE, strerror(errno));
 				ret=-1;
 				free(buf);
 				return ret;
@@ -231,57 +239,70 @@ static int handle_client(int client_fd, int data_fd){
 				ret=-1;
 				free(buf);
 				return ret;
+			}
 			memmove(buf,buf+pkt, len-pkt);//handle overlapping regions
-						      //len-=pkt;
+			len-=pkt;
 		}
 	}
 	free(buf);
 	return ret;
 }
 
-int main(void)
+int main(int argc, char *argv[])
 {
-    const char *filepath = DATAFILE;
-    // listen on sock_fd, new connection on new_fd
-    int sockfd, new_fd,write_fd;
-    struct addrinfo hints, *servinfo, *p;
-    struct sockaddr_storage their_addr; // connector's address info
-    socklen_t sin_size;
-    struct sigaction sa;
-    int yes=1;
-    char s[INET6_ADDRSTRLEN];
-    int rv, rc;
-    ssize_t rec_stat;
-    char *packet_buf;
+	int ret = -1;
+ 	int listen_fd = -1;
+ 	int data_fd = -1;
+	(void)argc;
+	(void)argv;
 
-    openlog("aesdsocket", LOG_PID, LOG_USER);
 
-    while(!exit_requested) {  // main accept() loop
-        sin_size = sizeof their_addr;
-        new_fd = accept(sockfd, (struct sockaddr *)&their_addr,
-            &sin_size);
-        if (new_fd == -1) {
-		if(errno == EINTR) continue;
-            	syslog(LOG_ERROR, "accept: %s", strerror(errno));
-            	continue;
-        }
+	openlog("aesdsocket",LOG_PID, LOG_USER);
 
-        inet_ntop(their_addr.ss_family,
-            get_in_addr((struct sockaddr *)&their_addr),
-            s, sizeof s);
-       
-	syslog(LOG_INFO, "Accepted connection from %s\n", s);
-	
-	rec_stat =recv(new_fd, packet_buf, sizeof(chunk), 0);
-	if(rec_stat==-1){
-		syslog(LOG_ERORR, "receive: %s", strerror(errno));
+	if(set_signals()==-1){
+		syslog(LOG_ERR, "sigaction: %s", strerror(errno));
+	    	goto errorhandler;
+    	}
+    	listen_fd=open_listen_socket();
+
+   	 if (listen_fd==-1)
+	    	goto errorhandler;
+    	data_fd=open(DATAFILE, O_RDWR | O_CREAT | O_APPEND, 0644);
+    	if(data_fd==-1){
+		syslog(LOG_ERR, "open %s: %s", DATAFILE, strerror(errno));
+	    	goto errorhandler;
+   	}
+
+    	while(!exit_requested){
+		struct sockaddr_storage client_addr;
+		socklen_t sin_size= sizeof client_addr;
+		char s[INET6_ADDRSTRLEN];
+		
+		int new_fd = accept(listen_fd, (struct sockaddr *)&client_addr, &sin_size);
+		if (new_fd==-1){
+			if(errno==EINTR)
+				continue;
+			syslog(LOG_ERR,"accept: %s", strerror(errno));
+			continue;
+		}
+
+		inet_ntop(client_addr.ss_family, get_in_addr((struct sockaddr *)&client_addr), s, sizeof s);
+		syslog(LOG_INFO, "Accepted connection from %s", s);
+		handle_client(new_fd, data_fd);
+		close(new_fd);
+		syslog(LOG_INFO, "Closed connection from %s", s);
 	}
-	else if (rec_stat==0){
-		syslog(LOG_WARNING, "remote client closed connection!");
-	}
-	memchar(packet_buf,
 
-    }
+	syslog(LOG_INFO, "Caught signal, exiting");
 
-    return 0;
+	ret= 0;
+
+errorhandler:
+	if(data_fd!=-1)
+		close(data_fd);
+	if(listen_fd!=-1)
+		close(listen_fd);
+	unlink(DATAFILE);
+	closelog();
+	return ret;
 }
