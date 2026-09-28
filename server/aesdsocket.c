@@ -248,14 +248,42 @@ static int handle_client(int client_fd, int data_fd){
 	return ret;
 }
 
+static int run_daemon(void){
+	pid_t pid = fork();
+	if(pid<0){
+		syslog(LOG_ERR,"fork: %s", strerror(errno));
+		return -1;
+	}
+	if (pid>0){
+		_exit(0);
+	}
+	if(setsid()==-1){
+		syslog(LOG_ERR, "setsid: %s", strerror(errno));
+		return -1;
+	}
+	if(chdir("/")==-1){
+		syslog(LOG_ERR, "chdir: %s", strerror(errno));
+		return -1;
+	}
+
+	int devnull = open("/dev/null", O_RDWR);
+	if(devnull!=-1){
+		dup2(devnull, STDIN_FILENO);
+		dup2(devnull, STDOUT_FILENO);
+		dup2(devnull, STDERR_FILENO);
+		if (devnull>STDERR_FILENO){
+			close(devnull);
+		}
+	}
+	return 0;
+}
 int main(int argc, char *argv[])
 {
 	int ret = -1;
  	int listen_fd = -1;
  	int data_fd = -1;
-	(void)argc;
-	(void)argv;
-
+	
+	bool start_daemon=(argc>=2 && strcmp(argv[1], "-d")==0);
 
 	openlog("aesdsocket",LOG_PID, LOG_USER);
 
@@ -265,8 +293,11 @@ int main(int argc, char *argv[])
     	}
     	listen_fd=open_listen_socket();
 
-   	 if (listen_fd==-1)
-	    	goto errorhandler;
+   	if (listen_fd==-1)
+		goto errorhandler;
+
+	if (start_daemon && run_daemon()==-1)
+		goto errorhandler;
     	data_fd=open(DATAFILE, O_RDWR | O_CREAT | O_APPEND, 0644);
     	if(data_fd==-1){
 		syslog(LOG_ERR, "open %s: %s", DATAFILE, strerror(errno));
