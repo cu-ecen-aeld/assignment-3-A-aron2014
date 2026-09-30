@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/bin/sh
 
 numargs=$#
 if [ $numargs -lt 2 ]
