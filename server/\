@@ -15,7 +15,7 @@
 #include <fcntl.h>
 #include <stdbool.h>
 #include <stdatomic.h>
-#include <sys/queue.h> 
+#include "queue.h" //Call for the local FreeBSD  version to get FOREACH_SAFE 
 #include <pthread.h>
 #include <semaphore.h>
 #include <sys/time.h>
@@ -34,7 +34,7 @@ struct thread_node{
 	int client_fd;
 	int data_fd;
 	pthread_mutex_t *file_mtx;//point to mutex in main
-	char client_ip[INET6_ADDRSTRLEN]; //for thread to log at socket close
+	char client_ip[INET6_ADDRESTRLEN]; //for thread to log at socket close
 	SLIST_ENTRY(thread_node) entries;
 
 };
@@ -43,7 +43,7 @@ SLIST_HEAD(thread_list, thread_node);
 
 static sem_t timed_sem;
 
-static atomic_int exit_requested = 0;
+static volatile sig_atomic_t exit_requested = 0;
 //Set flag to not interrupt current while loop cycle
 static void handle_signal(int signo){
 	(void)signo;
@@ -75,8 +75,8 @@ static void *timestamp_thread(void *arg){
 	struct ts_args *timestamp = arg;
 	char line[128];
 
-	while(1){
-		if(sem_wait(&timed_sem)==-1){
+	for(;;){
+		if(sem_wait(&imed_sem)==-1){
 			if(errno==EINTR){
 				continue;
 			}
@@ -126,12 +126,6 @@ static int set_signals(void){
 	
 	if(sigaction(SIGTERM, &sa, NULL)==-1) return -1;
 	
-	struct sigaction sa_alrm;
-	memset(&sa_alrm,0,sizeof sa_alrm);
-	sa_alrm.sa_handler=handle_alarm;
-	sa_alrm.sa_flags=0;
-	if(sigaction(SIGALRM,&sa_alrm,NULL)==-1)
-		return -1;
 	return 0;
 }
 
@@ -212,7 +206,7 @@ static int send_file(int data_fd, int client_fd){
 	return -1;	
      }
      ssize_t sent,n,off=0;
-     while(1)
+     for(;;)
      {
 	     n=read(data_fd, out, sizeof out);
 	     off=0;
@@ -221,8 +215,8 @@ static int send_file(int data_fd, int client_fd){
 		return 0;
 	     }
 	     if(n<1){
-	//	if(errno==EINTR)
-	//		continue;
+		if(errno==EINTR)
+			continue;
 		syslog(LOG_ERR, "read: %s", strerror(errno));
 		return -1;
 	     }
@@ -265,7 +259,7 @@ static int handle_client(struct thread_node *node){
 	int	ret=0;
 	bool discarding=false;
 	
-	while(1){
+	for(;;){
 		ssize_t n =recv(node->client_fd, chunk, sizeof chunk, 0);
 		if(n==0)
 			break;//Client closed
@@ -277,8 +271,7 @@ static int handle_client(struct thread_node *node){
 			}
 			syslog(LOG_ERR, "recv: %s", strerror(errno));
 			ret=-1;
-			//break;
-			goto handle_exit;
+			break;
 		}
 		char *in =chunk;
 		size_t in_len=(size_t)n;
@@ -317,27 +310,25 @@ static int handle_client(struct thread_node *node){
 		pthread_mutex_lock(node->file_mtx);
 		while(len>0 &&(nl=memchr(buf, '\n', len))!=NULL){
 			size_t pkt=(size_t)(nl-buf)+1; //this will include the \n character
-			if (write(node->data_fd, buf, pkt)!=(ssize_t)pkt){
+			if (write(node->data_fd, buf, pkt)!=(size_t)pkt){
 				syslog(LOG_ERR, "write %s failed: %s", DATAFILE, strerror(errno));
 				ret=-1;
-				pthread_mutex_unlock(node->file_mtx);
-				
-				goto handle_exit;
+				free(buf);
+				return ret;
 			}
 			if(send_file(node->data_fd,node->client_fd)==-1){
 				syslog(LOG_ERR, "send_file: %s", strerror(errno));
 				ret=-1;
-				pthread_mutex_unlock(node->file_mtx);
-				
-				goto handle_exit;
+				free(buf);
+				return ret;
 			}
 			memmove(buf,buf+pkt, len-pkt);//handle overlapping regions
 			len-=pkt;
 		}
- 		pthread_mutex_unlock(node->file_mtx);
+ 	
 	}
 	handle_exit:
-	//	pthread_mutex_unlock(node->file_mtx);
+		pthread_mutex_unlock(node->file_mtx);
 		free(buf);
 
 		return ret;
@@ -388,7 +379,7 @@ int main(int argc, char *argv[])
 	int ret = -1;
  	int listen_fd = -1;
  	int data_fd = -1;
-
+	struct thread_info *list;	
 	bool start_daemon=(argc>=2 && strcmp(argv[1], "-d")==0);
 
 	openlog("aesdsocket",LOG_PID, LOG_USER);
@@ -413,56 +404,17 @@ int main(int argc, char *argv[])
 	SLIST_INIT(&head); //Initialize the queue
 	pthread_mutex_t socket_mtx = PTHREAD_MUTEX_INITIALIZER;
 	
-	sigset_t old;
-	pthread_t ts_thread;	
 	//Set up timestamp logic and initialize semaphore
-	if(sem_init(&timed_sem,0,0)==-1){
-		syslog(LOG_ERR,"sem_init: %s", strerror(errno));
-		goto cleanup;
-	}
+	sem_init(&timed_sem,0,0);
 	struct ts_args ts = {.data_fd =data_fd, .file_mtx=&socket_mtx};
 	struct itimerval it = {.it_interval={10,0}, .it_value={10,0}};
-
-    	block_signals(&old);
-	
-	int ts_rc = pthread_create(&ts_thread,NULL,timestamp_thread,&ts);
-	pthread_sigmask(SIG_SETMASK,&old,NULL);
-
-	if(ts_rc!=0){
-		syslog(LOG_ERR, "pthread_create (timestamp): %s", strerror(ts_rc));
-		sem_destroy(&timed_sem);
-		goto cleanup;
-	}
-	if(setitimer(ITIMER_REAL,&it,NULL)==-1){
-		syslog(LOG_ERR,"setitimer: %s", strerror(errno));
-	}
-
+	setitimer(ITIMER_REAL,&it,NULL);
+    	
 	while(!exit_requested){
 		struct sockaddr_storage client_addr;
 		socklen_t sin_size= sizeof client_addr;
 		char s[INET6_ADDRSTRLEN];
 	
-		//Check here for if any threads in the linked list are complete
-		struct thread_node *prev=NULL;
-		struct thread_node *n=SLIST_FIRST(&head);
-		while(n!=NULL){
-			struct thread_node *next= SLIST_NEXT(n,entries);
-			if(atomic_load(&n->is_complete)){
-				pthread_join(n->socket_thread,NULL);
-				if(prev==NULL){
-					SLIST_REMOVE_HEAD(&head,entries);
-				}
-				else{
-					SLIST_NEXT(prev,entries)=next;
-				}
-				free(n);
-			}
-			else{
-				prev=n;
-			}
-			n=next;
-		}
-
 		
 		int new_fd = accept(listen_fd, (struct sockaddr *)&client_addr, &sin_size);
 		if (new_fd==-1){
@@ -471,12 +423,14 @@ int main(int argc, char *argv[])
 			syslog(LOG_ERR,"accept: %s", strerror(errno));
 			continue;
 		}
+		else if(new_fd >0){//a new file descriptor was created
 
-		inet_ntop(client_addr.ss_family, get_in_addr((struct sockaddr *)&client_addr), s, sizeof s);
-		syslog(LOG_INFO, "Accepted connection from %s", s);
-		syslog(LOG_INFO, "Spawning thread for fd %d", new_fd);
-			
-		//Add new thread to linked list
+			inet_ntop(client_addr.ss_family, get_in_addr((struct sockaddr *)&client_addr), s, sizeof s);
+			syslog(LOG_INFO, "Accepted connection from %s", s);
+			syslog(LOG_INFO, "Spawning thread for fd %d", new_fd);
+			prev_fd=new_fd;
+
+			//Add new thread to linked list
 		struct thread_node *node = calloc(1, sizeof *node);
 		if (node==NULL){
 			syslog(LOG_ERR, "calloc failed, terminating conenction");
@@ -487,10 +441,8 @@ int main(int argc, char *argv[])
 		node->data_fd=data_fd;
 		node->file_mtx=&socket_mtx;
 		memcpy(node->client_ip, s, sizeof node->client_ip);
-		block_signals(&old);
-		int rc = pthread_create(&node->socket_thread, NULL, thread_handler, node);
-		pthread_sigmask(SIG_SETMASK, &old,NULL);
 
+		int rc = pthread_create(&node->thread, NULL, thread_handler, node);
 		if(rc!=0){
 			//failed to create thread, close socket and free data
 			syslog(LOG_ERR, "pthread_create: %s", strerror(rc));
@@ -500,6 +452,16 @@ int main(int argc, char *argv[])
 
 		}
 		SLIST_INSERT_HEAD(&head, node, entries);
+		//Check here for if any threads in the linked list are complete
+		struct thread_node *n, *tmp;
+		SLIST_FOREACH_SAFE(n, &head, entries, tmp){
+			if(n->is_complete){
+				pthread_join(n->thread, NULL);
+				SLIST_REMOVE(&head, n, thread_node, entries);
+				free(n);
+			}
+		}
+
 	}
 
 	syslog(LOG_INFO, "Caught signal, exiting");
