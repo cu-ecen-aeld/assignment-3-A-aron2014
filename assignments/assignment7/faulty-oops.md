@@ -1,5 +1,5 @@
-#Analysis of the Kernel Oops
-'''# echo "hello_world" > /dev/faulty
+# Analysis of the Kernel Oops
+```# echo "hello_world" > /dev/faulty
 Unable to handle kernel NULL pointer dereference at virtual address 0000000000000000
 Mem abort info:
   ESR = 0x0000000096000045
@@ -42,7 +42,7 @@ Call trace:
  el0t_64_sync+0x18c/0x190
 Code: d2800001 d2800000 d503233f d50323bf (b900003f) 
 ---[ end trace 0000000000000000 ]---
-'''
+```
 
 
 
@@ -50,5 +50,22 @@ When echo is run on /dev/faulty, userspace calls the write() syscall on /dev/fau
 The kernel routed this to faulty_write, and that function attempted to write a 0 to address 0. 
 The kernel detected the NULL pointer dereference, printed a kernel oops, 
 and killed the sh process (PID 151), which caused a new login prompt to appear. 
-The kernel itself kept running. The pc line shows the fault occurred at faulty_write+0x10, 
-0x10 bytes into the 0x20-byte function. The EC describes a code of 0x25 DABT which is a data abort caused by a write to an unmapped address 0. this is shown by the WnR=1 and FSC = 0x05
+The kernel itself kept running. The pc line shows the fault occurred at faulty_write+0x10, at an offset of 0x10 bytes into the 0x20-byte function. The EC describes a code of 0x25 DABT which is a data abort caused by a write to an unmapped address 0. This is further shown by the WnR=1 and FSC = 0x05.
+
+## Locating the faulty line that caused the crash
+Using the objdump that was created the actual lines within the kernel module that caused the fault can be traced as well.
+```
+output/build/ldd-b93eda713ae4158b69294559f5d006295dc62eb3/misc-modules/faulty.ko:     file format elf64-littleaarch64
+
+
+Disassembly of section .text:
+
+0000000000000000 <faulty_write>:
+   0:	d2800001 	mov	x1, #0x0                   	// #0
+   4:	d2800000 	mov	x0, #0x0                   	// #0
+   8:	d503233f 	paciasp
+   c:	d50323bf 	autiasp
+  10:	b900003f 	str	wzr, [x1]
+  14:	d65f03c0 	ret
+```
+At offset 0x10,``` str wzr, [x1]``` stores zero to the address held in x1. The register dump shows x1 = 0, so this is a write to address 0. The instruction bytes b900003f match the faulting instruction shown in parentheses on the oops Code: line. This corresponds to``` *(int *)0 = 0;``` in faulty_write() in misc-modules/faulty.c
