@@ -21,11 +21,18 @@
 #include <sys/time.h>
 #include <time.h>
 
-#define PORT ("9000")
-#define BACKLOG (10)
-#define DATAFILE ("/var/tmp/aesdsocketdata")
-#define CHUNK_SIZE (1024)
+#ifndef USE_AESD_CHAR_DEVICE
+#define USE_AESD_CHAR_DEVICE 1
+#endif
 
+#define PORT ("9000")
+#define BACKLOG (10)// how many pending connections queue will hold
+#if USE_AESD_CHAR_DEVICE
+#define DATAFILE ("/dev/aesdchar")
+#else
+#define DATAFILE "/var/tmp/aesdsocketdata"
+#endif
+#define CHUNK_SIZE (1024)//set chunk size to 1KB for reading and writing data
 
 //Thread parameters 
 struct thread_node{
@@ -50,6 +57,7 @@ static void handle_signal(int signo){
 	exit_requested = 1;
 }
 
+//Signal handler for SIGALRM to post to semaphore
 static void handle_alarm(int signo){
 	(void)signo;
 	int saved_errno=errno;//store errno temporarily in case an interrupt writes errno
@@ -57,6 +65,7 @@ static void handle_alarm(int signo){
 	errno=saved_errno;
 }
 
+//set up signal mask to block SIGINT, SIGTERM, and SIGALRM for a thread.
 static void block_signals(sigset_t *old){
 	sigset_t set;
 	sigemptyset(&set);
@@ -70,7 +79,9 @@ struct ts_args{
 	int data_fd;
 	pthread_mutex_t *file_mtx;
 };
-
+//ignore this if using aesd char device
+#if !USE_AESD_CHAR_DEVICE
+//Thread function to handle timestamp calls every 10s, called by SIGALRM and posts to semaphore to wake up this thread
 static void *timestamp_thread(void *arg){
 	struct ts_args *timestamp = arg;
 	char line[128];
@@ -104,7 +115,7 @@ static void *timestamp_thread(void *arg){
 	}
 	return NULL;
 }
-
+#endif
 // get sockaddr, IPv4 or IPv6:
 void *get_in_addr(struct sockaddr *sa)
 {
@@ -115,6 +126,7 @@ void *get_in_addr(struct sockaddr *sa)
     return &(((struct sockaddr_in6*)sa)->sin6_addr);
 }
 
+//Set up signal handlers for SIGINT and SIGTERM to set exit_requested flag
 static int set_signals(void){
 	struct sigaction sa;
 	memset(&sa, 0, sizeof sa);
@@ -134,7 +146,7 @@ static int set_signals(void){
 		return -1;
 	return 0;
 }
-
+//Open and bind listen socket for incoming connections
 static int open_listen_socket(void){
 	struct addrinfo hints, *servinfo, *p;
 	int sockfd = -1;
@@ -160,7 +172,7 @@ static int open_listen_socket(void){
         
 	    		continue;
         	}
-
+		//Allow socket to be reused immediately after program exits
         	if (setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &yes,sizeof(int)) == -1) {
             		perror("setsockopt");
 	    		syslog(LOG_ERR, "setsockopt: %s", strerror(errno));
@@ -169,7 +181,7 @@ static int open_listen_socket(void){
             
 	    		return -1;
         	}
-
+		//bind socket to port
         	if (bind(sockfd, p->ai_addr, p->ai_addrlen) == -1) {
             		close(sockfd);
             		perror("server: bind");
@@ -190,7 +202,7 @@ static int open_listen_socket(void){
         
 		return -1;
     	}
-
+	//Listen for incoming connections
     	if (listen(sockfd, BACKLOG) == -1) {
         	perror("listen");
 		syslog(LOG_ERR, "listen: %s", strerror(errno));
@@ -203,15 +215,13 @@ static int open_listen_socket(void){
 	
 }
 
+//Send file contents to client socket
 static int send_file(int data_fd, int client_fd){
+	//set output buffer to 1KB for reading and writing data
      char out[CHUNK_SIZE];
-
-     if(lseek(data_fd, 0,SEEK_SET )<0){
-     	syslog(LOG_ERR, "lseek: %s", strerror(errno));
-     	
-	return -1;	
-     }
+    
      ssize_t sent,n,off=0;
+         //Loop to read from file and send to client socket until end of file is reached
      while(1)
      {
 	     n=read(data_fd, out, sizeof out);
@@ -221,13 +231,12 @@ static int send_file(int data_fd, int client_fd){
 		return 0;
 	     }
 	     if(n<1){
-	//	if(errno==EINTR)
-	//		continue;
 		syslog(LOG_ERR, "read: %s", strerror(errno));
 		return -1;
 	     }
-
+	     //Loop to send data to client socket until all bytes are sent
 	     while (off<n){
+		//MSG_NOSIGNAL flag is used to prevent SIGPIPE signal from being sent to the process if the client has closed the connection.
 	     	sent =send(client_fd, out+off, n-off,MSG_NOSIGNAL);
 		if(sent<0){
 			if(errno==EINTR)
@@ -239,6 +248,43 @@ static int send_file(int data_fd, int client_fd){
 	     	off+= sent;
 	     }
      }	     
+}
+
+//Adding helper functions for inclusion of AESD_CHAR_DEVICE
+static int write_packet(struct thread_node *node, const char *buf, size_t pkt){
+#if USE_AESD_CHAR_DEVICE
+	(void)node;
+
+	int fd = open(DATAFILE, O_WRONLY);
+	if(fd==-1){
+		syslog(LOG_ERR, "open %s: %s", DATAFILE, strerror(errno));
+		return -1;
+	}
+	ssize_t w=write(fd,buf,pkt);
+	close(fd);
+	return(w==(ssize_t)pkt)?0:-1;
+#else
+	return (write(node->data_fd,buf,pkt)==(ssize_t)pkt)?0:-1;
+#endif
+}
+
+static int send_data(struct thread_node *node){
+#if USE_AESD_CHAR_DEVICE
+	int fd=open(DATAFILE,O_RDONLY);
+	if(fd==-1){
+		syslog(LOG_ERR, "open %s: %s", DATAFILE, strerror(errno));
+		return -1;
+	}
+	int rc=send_file(fd,node->client_fd);
+	close(fd);
+	return rc;
+#else
+	if(lseek(node->data_fd,0,SEEK_SET)<0){
+		syslog(LOG_ERR, "lseek: %s", strerror(errno));
+		return -1;
+	}
+	return send_file(node->data_fd, node->client_fd);
+#endif
 }
 
 static int grow_buffer(char **buf, size_t *cap, size_t need){
@@ -257,6 +303,8 @@ static int grow_buffer(char **buf, size_t *cap, size_t need){
 	*cap=new_cap;
 	return 0;
 }
+
+//Handle client connection, read data from socket, write to file, and send file contents back to client
 static int handle_client(struct thread_node *node){
 	char	chunk[CHUNK_SIZE];
 	char	*buf=NULL;
@@ -266,6 +314,7 @@ static int handle_client(struct thread_node *node){
 	bool discarding=false;
 	
 	while(1){
+		//Read data from client socket into chunk buffer
 		ssize_t n =recv(node->client_fd, chunk, sizeof chunk, 0);
 		if(n==0)
 			break;//Client closed
@@ -283,9 +332,9 @@ static int handle_client(struct thread_node *node){
 		char *in =chunk;
 		size_t in_len=(size_t)n;
 
-		//Lock AFTER receiving chunk to not block all other threads
-	
+		//Loop to process incoming data from client socket, handle over-length packets, and write complete packets to file
 		while(in_len>0){
+			//Check if currently discarding data due to over-length packet
 			if(discarding){
 				//Handling for over-length packet
 				char *nextline = memchr(in,'\n', in_len);
@@ -293,6 +342,7 @@ static int handle_client(struct thread_node *node){
 					in_len=0;//whole chunk missed a newline character
 				}
 				else{
+					//Found newline character, stop discarding and continue processing
 					size_t skip=(size_t)(nextline-in)+1;
 					in += skip;
 					in_len -= skip;
@@ -300,6 +350,7 @@ static int handle_client(struct thread_node *node){
 				}
 				continue;
 			}
+			//Check if incoming data exceeds maximum packet size, and if so, discard the packet and log an error message
 			if(grow_buffer(&buf, &cap, len+in_len)==-1){
 				syslog(LOG_ERR, "out of memory at %zu bytes, discarding packet", len+in_len);
 				len = 0;
@@ -317,14 +368,16 @@ static int handle_client(struct thread_node *node){
 		pthread_mutex_lock(node->file_mtx);
 		while(len>0 &&(nl=memchr(buf, '\n', len))!=NULL){
 			size_t pkt=(size_t)(nl-buf)+1; //this will include the \n character
-			if (write(node->data_fd, buf, pkt)!=(ssize_t)pkt){
+			if (write_packet(node, buf, pkt) ==-1){
 				syslog(LOG_ERR, "write %s failed: %s", DATAFILE, strerror(errno));
 				ret=-1;
 				pthread_mutex_unlock(node->file_mtx);
 				
 				goto handle_exit;
+
 			}
-			if(send_file(node->data_fd,node->client_fd)==-1){
+			//Send the contents of the file back to the client socket
+			if(send_data(node)==-1){
 				syslog(LOG_ERR, "send_file: %s", strerror(errno));
 				ret=-1;
 				pthread_mutex_unlock(node->file_mtx);
@@ -334,6 +387,7 @@ static int handle_client(struct thread_node *node){
 			memmove(buf,buf+pkt, len-pkt);//handle overlapping regions
 			len-=pkt;
 		}
+		//Unlock the mutex after processing the data as a catchall.
  		pthread_mutex_unlock(node->file_mtx);
 	}
 	handle_exit:
@@ -343,6 +397,7 @@ static int handle_client(struct thread_node *node){
 		return ret;
 }
 
+//Thread function to handle client connection, called by main thread
 static void *thread_handler(void *arg){
 	struct thread_node *node=arg;
 	handle_client(node);
@@ -352,7 +407,9 @@ static void *thread_handler(void *arg){
 	return NULL;
 }
 
-
+//Run the program as a daemon by forking a child process, 
+//creating a new session, changing the working directory to root, 
+// and redirecting standard input/output/error to /dev/null
 static int run_daemon(void){
 	pid_t pid = fork();
 	if(pid<0){
@@ -370,7 +427,7 @@ static int run_daemon(void){
 		syslog(LOG_ERR, "chdir: %s", strerror(errno));
 		return -1;
 	}
-
+	//Redirect standard input/output/error to /dev/null
 	int devnull = open("/dev/null", O_RDWR);
 	if(devnull!=-1){
 		dup2(devnull, STDIN_FILENO);
@@ -388,32 +445,37 @@ int main(int argc, char *argv[])
 	int ret = -1;
  	int listen_fd = -1;
  	int data_fd = -1;
-
+	//Check if the -d option is specified to run the program as a daemon
 	bool start_daemon=(argc>=2 && strcmp(argv[1], "-d")==0);
-
+	//Open syslog for logging
 	openlog("aesdsocket",LOG_PID, LOG_USER);
-
+	//Set up signal handlers for SIGINT and SIGTERM to set exit_requested flag
 	if(set_signals()==-1){
 		syslog(LOG_ERR, "sigaction: %s", strerror(errno));
 	    	goto cleanup;
     	}
+	//Open and bind listen socket for incoming connections
     	listen_fd=open_listen_socket();
 
    	if (listen_fd==-1)
 		goto cleanup;
-
+	//If -d option is specified, run listening socket as daemon
 	if (start_daemon && run_daemon()==-1)
 		goto cleanup;
+#if !USE_AESD_CHAR_DEVICE
     	data_fd=open(DATAFILE, O_RDWR | O_CREAT | O_APPEND, 0644);
     	if(data_fd==-1){
 		syslog(LOG_ERR, "open %s: %s", DATAFILE, strerror(errno));
 	    	goto cleanup;
    	}
+#endif
+
 	struct thread_list head;
 	SLIST_INIT(&head); //Initialize the queue
 	pthread_mutex_t socket_mtx = PTHREAD_MUTEX_INITIALIZER;
 	
 	sigset_t old;
+#if !USE_AESD_CHAR_DEVICE
 	pthread_t ts_thread;	
 	//Set up timestamp logic and initialize semaphore
 	if(sem_init(&timed_sem,0,0)==-1){
@@ -422,21 +484,24 @@ int main(int argc, char *argv[])
 	}
 	struct ts_args ts = {.data_fd =data_fd, .file_mtx=&socket_mtx};
 	struct itimerval it = {.it_interval={10,0}, .it_value={10,0}};
-
+	//Block signals for main thread and spawn timestamp thread
     	block_signals(&old);
 	
 	int ts_rc = pthread_create(&ts_thread,NULL,timestamp_thread,&ts);
+	//restore original signal mask for main thread so that SIGINT and SIGTERM can be handled
 	pthread_sigmask(SIG_SETMASK,&old,NULL);
-
+	//Handle return code for thread creation and release semaphore.
 	if(ts_rc!=0){
 		syslog(LOG_ERR, "pthread_create (timestamp): %s", strerror(ts_rc));
 		sem_destroy(&timed_sem);
 		goto cleanup;
 	}
+	//Set up timer to send SIGALRM every 10 seconds
 	if(setitimer(ITIMER_REAL,&it,NULL)==-1){
 		syslog(LOG_ERR,"setitimer: %s", strerror(errno));
 	}
-
+#endif
+	//Main loop to accept incoming connections and spawn threads to handle them
 	while(!exit_requested){
 		struct sockaddr_storage client_addr;
 		socklen_t sin_size= sizeof client_addr;
@@ -462,8 +527,7 @@ int main(int argc, char *argv[])
 			}
 			n=next;
 		}
-
-		
+		//Accept incoming connection
 		int new_fd = accept(listen_fd, (struct sockaddr *)&client_addr, &sin_size);
 		if (new_fd==-1){
 			if(errno==EINTR)
@@ -471,22 +535,24 @@ int main(int argc, char *argv[])
 			syslog(LOG_ERR,"accept: %s", strerror(errno));
 			continue;
 		}
-
+		//Get the IP address of the client and log it
 		inet_ntop(client_addr.ss_family, get_in_addr((struct sockaddr *)&client_addr), s, sizeof s);
 		syslog(LOG_INFO, "Accepted connection from %s", s);
 		syslog(LOG_INFO, "Spawning thread for fd %d", new_fd);
 			
-		//Add new thread to linked list
+		//Add new thread to linked list, using calloc to allocate zeroed  memory for the thread node 
 		struct thread_node *node = calloc(1, sizeof *node);
 		if (node==NULL){
 			syslog(LOG_ERR, "calloc failed, terminating conenction");
 			close(new_fd);
 			continue;
 		}
+		//Initialize thread node and spawn thread to handle client connection
 		node->client_fd=new_fd;
 		node->data_fd=data_fd;
 		node->file_mtx=&socket_mtx;
 		memcpy(node->client_ip, s, sizeof node->client_ip);
+		//Block signals for thread creation to avoid race conditions with signal handling
 		block_signals(&old);
 		int rc = pthread_create(&node->socket_thread, NULL, thread_handler, node);
 		pthread_sigmask(SIG_SETMASK, &old,NULL);
@@ -499,18 +565,21 @@ int main(int argc, char *argv[])
 			continue;
 
 		}
+		//Add thread node to linked list
 		SLIST_INSERT_HEAD(&head, node, entries);
 	}
 
 	syslog(LOG_INFO, "Caught signal, exiting");
 
 	ret= 0;
-
+#if !USE_AESD_CHAR_DEVICE
+	//Clean up resources and exit gracefully
 	struct itimerval off={0};
 	setitimer(ITIMER_REAL, &off, NULL);
+#endif
 	close(listen_fd);
 	listen_fd=-1;
-
+	//Close all client connections and join threads
 	struct thread_node *n;
 	SLIST_FOREACH(n,&head,entries)
 		shutdown(n->client_fd, SHUT_RDWR);
@@ -520,16 +589,21 @@ int main(int argc, char *argv[])
 		SLIST_REMOVE_HEAD(&head, entries);
 		free(n);
 	}
+#if !USE_AESD_CHAR_DEVICE
+	//Post to semaphore to wake up timestamp thread and join it
 	sem_post(&timed_sem);
 	pthread_join(ts_thread,NULL);
 	sem_destroy(&timed_sem);
+#endif
 	pthread_mutex_destroy(&socket_mtx);
 cleanup:
 	if(data_fd!=-1)
 		close(data_fd);
 	if(listen_fd!=-1)
 		close(listen_fd);
+#if !USE_AESD_CHAR_DEVICE
 	unlink(DATAFILE);
+#endif
 	closelog();
 	return ret;
 }
