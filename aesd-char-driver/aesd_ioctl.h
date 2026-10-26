@@ -34,7 +34,7 @@ struct aesd_seekto {
 };
 
 // Pick an arbitrary unused value from https://github.com/torvalds/linux/blob/master/Documentation/userspace-api/ioctl/ioctl-number.rst
-#define AESD_IOC_MAGIC 0x16
+#define AESD_IOC_MAGIC 0xFE //Previously 0x16
 
 // Define a write command from the user point of view, use command number 1
 #define AESDCHAR_IOCSEEKTO _IOWR(AESD_IOC_MAGIC, 1, struct aesd_seekto)

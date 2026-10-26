@@ -21,6 +21,12 @@
 #include <sys/time.h>
 #include <time.h>
 
+#include <sys/ioctl.h>
+#include "../aesd-char-driver/aesd_ioctl.h"
+
+#define SEEKTO_START "AESDCHAR_IOCSEEKTO:"
+#define SEEKTO_LEN (sizeof(SEEKTO_START)-1)
+
 #ifndef USE_AESD_CHAR_DEVICE
 #define USE_AESD_CHAR_DEVICE 1
 #endif
@@ -146,6 +152,7 @@ static int set_signals(void){
 		return -1;
 	return 0;
 }
+
 //Open and bind listen socket for incoming connections
 static int open_listen_socket(void){
 	struct addrinfo hints, *servinfo, *p;
@@ -212,7 +219,6 @@ static int open_listen_socket(void){
     	}
 
    	return sockfd;
-	
 }
 
 //Send file contents to client socket
@@ -250,7 +256,43 @@ static int send_file(int data_fd, int client_fd){
      }	     
 }
 
-//Adding helper functions for inclusion of AESD_CHAR_DEVICE
+
+#if USE_AESD_CHAR_DEVICE
+static bool is_seek_command(const char *buffer, size_t pkt){
+	return pkt > SEEKTO_LEN && strncmp(buffer,SEEKTO_START, SEEKTO_LEN)==0; //using strncmp to compare both strings up to SEEKTO_LEN characters
+}
+
+static int parse_seek(struct thread_node *node, const char *buffer){
+	struct aesd_seekto seekto;
+	unsigned int cmd, offset;
+	//validate that 2 commands were provided
+	if(sscanf(buffer+SEEKTO_LEN, "%u,%u", &cmd, &offset)!=2){
+		syslog(LOG_ERR, "parse_seek: sscanf failed for %s", buffer);
+		return -1;
+	}
+	seekto.write_cmd=cmd;
+	seekto.write_cmd_offset=offset; 
+
+	int fd = open(DATAFILE, O_RDWR);
+	if(fd==-1){
+		syslog(LOG_ERR, "open %s: %s", DATAFILE, strerror(errno));
+		return -1;
+	}
+
+	if(ioctl(fd,AESDCHAR_IOCSEEKTO, &seekto)==-1){
+		syslog(LOG_ERR,"ioctl: %s", strerror(errno));
+		close(fd);
+		return -1;
+	}
+
+	int rc =send_file(fd,node->client_fd);
+	close(fd);
+	return rc;
+}
+
+#endif
+
+//Adding packet writer for AESDCHAR_DEVICE to write to the char device instead of a file
 static int write_packet(struct thread_node *node, const char *buf, size_t pkt){
 #if USE_AESD_CHAR_DEVICE
 	(void)node;
@@ -268,6 +310,7 @@ static int write_packet(struct thread_node *node, const char *buf, size_t pkt){
 #endif
 }
 
+//Reading from the CHAR device or file and sending data back to the client socket
 static int send_data(struct thread_node *node){
 #if USE_AESD_CHAR_DEVICE
 	int fd=open(DATAFILE,O_RDONLY);
@@ -279,6 +322,7 @@ static int send_data(struct thread_node *node){
 	close(fd);
 	return rc;
 #else
+	//Reset file offset to beginning of file before sending data back to client socket
 	if(lseek(node->data_fd,0,SEEK_SET)<0){
 		syslog(LOG_ERR, "lseek: %s", strerror(errno));
 		return -1;
@@ -368,30 +412,40 @@ static int handle_client(struct thread_node *node){
 		pthread_mutex_lock(node->file_mtx);
 		while(len>0 &&(nl=memchr(buf, '\n', len))!=NULL){
 			size_t pkt=(size_t)(nl-buf)+1; //this will include the \n character
-			if (write_packet(node, buf, pkt) ==-1){
-				syslog(LOG_ERR, "write %s failed: %s", DATAFILE, strerror(errno));
-				ret=-1;
-				pthread_mutex_unlock(node->file_mtx);
-				
-				goto handle_exit;
 
+			if(is_seek_command(buf,pkt)){
+				if(parse_seek(node,buf)==-1){
+					ret = -1;
+					pthread_mutex_unlock(node->file_mtx);
+
+					goto handle_exit;
+				}
 			}
-			//Send the contents of the file back to the client socket
-			if(send_data(node)==-1){
-				syslog(LOG_ERR, "send_file: %s", strerror(errno));
-				ret=-1;
-				pthread_mutex_unlock(node->file_mtx);
-				
-				goto handle_exit;
+			else{
+				if (write_packet(node, buf, pkt) ==-1){
+					syslog(LOG_ERR, "write %s failed: %s", DATAFILE, strerror(errno));
+					ret=-1;
+					pthread_mutex_unlock(node->file_mtx);
+					
+					goto handle_exit;
+				}
+				//Send the contents of the file back to the client socket
+				if(send_data(node)==-1){
+					syslog(LOG_ERR, "send_file: %s", strerror(errno));
+					ret=-1;
+					pthread_mutex_unlock(node->file_mtx);
+					
+					goto handle_exit;
+				}
 			}
 			memmove(buf,buf+pkt, len-pkt);//handle overlapping regions
 			len-=pkt;
+
 		}
 		//Unlock the mutex after processing the data as a catchall.
- 		pthread_mutex_unlock(node->file_mtx);
+		pthread_mutex_unlock(node->file_mtx);
 	}
 	handle_exit:
-	//	pthread_mutex_unlock(node->file_mtx);
 		free(buf);
 
 		return ret;
